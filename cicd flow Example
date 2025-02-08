@@ -1,0 +1,104 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main  # Runs on push to main branch
+
+jobs:
+  code-quality-scan:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Maven
+        run: mvn clean install -DskipTests
+
+      - name: SonarQube Analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn sonar:sonar -Dsonar.projectKey=my-app -Dsonar.organization=my-org -Dsonar.host.url=https://sonarcloud.io
+
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: code-quality-scan  # Run only after SonarQube check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to AWS ECR
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Authenticate Docker to AWS ECR
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_REPOSITORY }}
+
+      - name: Build and Tag Docker Image
+        run: |
+          docker build -t my-app:${{ github.sha }} .
+          docker tag my-app:${{ github.sha }} ${{ secrets.ECR_REPOSITORY }}:latest
+          docker tag my-app:${{ github.sha }} ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Push Docker Image to AWS ECR
+        run: |
+          docker push ${{ secrets.ECR_REPOSITORY }}:latest
+          docker push ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+
+  security-scan:
+    name: Security Scan with Trivy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          trivy --version
+
+      - name: Run Trivy Image Scan
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL ${{ secrets.ECR_REPOSITORY }}:latest
+
+  deploy:
+    name: Deploy to AWS EKS via ArgoCD
+    needs: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update Kubernetes Deployment
+        run: |
+          aws eks update-kubeconfig --name my-eks-cluster --region ${{ secrets.AWS_REGION }}
+          kubectl patch deployment my-app -n my-namespace -p \
+            "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"my-app\",\"image\":\"${{ secrets.ECR_REPOSITORY }}:latest\"}]}}}}"
+
+      - name: Sync ArgoCD to Deploy Latest Image
+        run: |
+          argocd app sync my-app
